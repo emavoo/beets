@@ -17,6 +17,8 @@
 import base64
 import json
 import os
+import shutil
+import tempfile
 import typing as t
 
 import flask
@@ -27,7 +29,9 @@ from werkzeug.routing import BaseConverter, PathConverter
 import beets.library
 from beets import ui, util
 from beets.dbcore.query import PathQuery
+from beets.library.exceptions import ReadError
 from beets.plugins import BeetsPlugin
+from beets.util import MoveOperation
 
 # Type checking hacks
 
@@ -203,12 +207,18 @@ def resource_query(name, patchable=False):
                 )
 
             elif get_method() == "GET":
-                return app.response_class(
+                paginated, total = _paginate(entities)
+                response = app.response_class(
                     json_generator(
-                        entities, root="results", expand=is_expand()
+                        paginated, root="results", expand=is_expand()
                     ),
                     mimetype="application/json",
                 )
+                if total is not None:
+                    response.headers["X-Total-Count"] = total
+                    response.headers["Access-Control-Expose-Headers"] = \
+                        "X-Total-Count"
+                return response
 
             else:
                 return flask.abort(405)
@@ -220,6 +230,22 @@ def resource_query(name, patchable=False):
     return make_responder
 
 
+def _paginate(items):
+    """Apply pagination to an iterable based on request query params.
+
+    Supports ?page=N&per_page=M. Returns (paginated_list, total_count)
+    or (original_items, None) when no pagination is requested.
+    """
+    page = flask.request.args.get("page", type=int)
+    per_page = flask.request.args.get("per_page", default=50, type=int)
+    if page is None:
+        return items, None
+    items_list = list(items)
+    total = len(items_list)
+    start = (page - 1) * per_page
+    return items_list[start:start + per_page], total
+
+
 def resource_list(name):
     """Decorates a function to handle RESTful HTTP request for a list of
     resources.
@@ -227,10 +253,16 @@ def resource_list(name):
 
     def make_responder(list_all):
         def responder():
-            return app.response_class(
-                json_generator(list_all(), root=name, expand=is_expand()),
+            items, total = _paginate(list_all())
+            response = app.response_class(
+                json_generator(items, root=name, expand=is_expand()),
                 mimetype="application/json",
             )
+            if total is not None:
+                response.headers["X-Total-Count"] = total
+                response.headers["Access-Control-Expose-Headers"] = \
+                    "X-Total-Count"
+            return response
 
         responder.__name__ = f"all_{name}"
         return responder
@@ -330,9 +362,19 @@ def item_file(item_id):
         safe_filename = base_filename
 
     response = flask.send_file(
-        item_path, as_attachment=True, download_name=safe_filename
+        item_path, as_attachment=True, download_name=safe_filename,
+        conditional=True,
     )
     return response
+
+
+@app.route("/item/<int:item_id>/lyrics")
+def item_lyrics(item_id):
+    item = g.lib.get_item(item_id)
+    if not item:
+        return flask.abort(404)
+    lyrics = getattr(item, "lyrics", None) or ""
+    return flask.jsonify(id=item_id, lyrics=lyrics)
 
 
 @app.route("/item/query/<query:queries>", methods=["GET", "DELETE", "PATCH"])
@@ -431,6 +473,82 @@ def stats():
             "albums": album_rows[0][0],
         }
     )
+
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".wav",
+    ".aiff", ".aif", ".opus", ".ape", ".wv", ".mpc",
+}
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    if app.config.get("READONLY", True):
+        return flask.abort(405)
+
+    uploaded = flask.request.files.getlist("files")
+    cover_file = flask.request.files.get("cover")
+
+    if not uploaded:
+        return flask.make_response(
+            jsonify({"error": "No files uploaded"}), 400
+        )
+
+    tmpdir = tempfile.mkdtemp(prefix="beets-upload-")
+    try:
+        items = []
+        errors = []
+        for f in uploaded:
+            ext = os.path.splitext(f.filename or "")[1].lower()
+            if ext not in AUDIO_EXTENSIONS:
+                errors.append({"file": f.filename, "error": "Unsupported format"})
+                continue
+            safe_name = f.filename or f"track{ext}"
+            dest = os.path.join(tmpdir, safe_name)
+            f.save(dest)
+            try:
+                item = beets.library.Item.from_path(dest)
+                items.append(item)
+            except ReadError:
+                errors.append({"file": f.filename, "error": "Could not read metadata"})
+
+        if not items:
+            return flask.make_response(
+                jsonify({"error": "No valid audio files", "details": errors}), 400
+            )
+
+        lib = g.lib
+        has_album_tag = any(item.album for item in items)
+
+        if has_album_tag and len(items) > 0:
+            album = lib.add_album(items)
+
+            if cover_file:
+                cover_ext = os.path.splitext(cover_file.filename or ".jpg")[1]
+                cover_path = os.path.join(tmpdir, f"cover{cover_ext}")
+                cover_file.save(cover_path)
+                album.set_art(cover_path)
+
+            album.move(operation=MoveOperation.COPY)
+
+            return flask.jsonify({
+                "album": _rep(album, expand=True),
+                "errors": errors,
+            })
+        else:
+            added = []
+            for item in items:
+                lib.add(item)
+                item.move(operation=MoveOperation.COPY)
+                item.store()
+                added.append(_rep(item))
+
+            return flask.jsonify({
+                "items": added,
+                "errors": errors,
+            })
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # UI.
